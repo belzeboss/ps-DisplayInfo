@@ -146,4 +146,179 @@ function TogglePrimaryMonitorFHD
 	{
 		[WinLib.U32]::ChangeResolution($p.Index, 2560, 1440, $false)
 	}
+	# reset current wallpapers (only works for transcoded atm)
+	SetWallpaper
+}
+
+function SetWallpaper
+{
+	param(
+		[Parameter(ValueFromPipeline=$true)][string]$FilePath = $null,
+		[int]$Index = -1,
+		[int]$X = -1,
+		[int]$Y = -1
+	)
+	begin {
+	$settingsPath = ([System.IO.Path]::GetTempPath() + "TranscodedImage.json")
+	$settings = gc $settingsPath -ErrorAction SilentlyContinue | ConvertFrom-Json
+	if ($null -eq $settings) {
+		Write-Verbose "Create new Settings"
+		$info = @{}
+		$info.GridX = 1
+		$info.GridY = 1
+		$info.Path = ""
+		$settings = $info,$info
+	}
+
+	$iterate = $Index -lt 0
+	if ($iterate){
+		$Index = 0
+	}
+	$Index = $Index % $settings.Count
+	$validX = $X -ge 0
+	$validY = $Y -ge 0
+
+	function finalize {
+		$newBitmapPath = ([System.IO.Path]::GetTempPath() + "TranscodedImage.bmp")
+		TranscodeWallpaper $settings $newBitmapPath
+		if (-not [WinLib.U32]::SetWallpaper($newBitmapPath, 3)){
+			Write-Error "Can't save $newBitmapPath"
+		}
+		ConvertTo-Json -InputObject $settings | Out-file $settingsPath
+	}
+
+	}
+	process {
+		Write-Verbose "FilePath=$FilePath"
+		if ($settings.Count -eq 0){
+			Write-Verbose "No Settings"
+			break
+		}
+		if ($validX) { $settings[$Index].GridX = $X }
+		if ($validY) { $settings[$Index].GridY = $Y }
+		if ("$FilePath".Length -gt 0){ $settings[$Index].Path = $FilePath }
+		$Index++
+		if ($Index -eq $settings.Count -or -not $iterate){
+			Write-Verbose "Done processing pipeline"
+			finalize
+			break
+		}
+	}
+	end {
+		if ($iterate) {
+			$n = $Index
+			Write-Verbose "Iterate through $n starting at $Index/$($settings.Count)"
+			for (;$Index -lt $settings.Count; ++$Index) {
+				if ($validX) { $settings[$Index].GridX = $X }
+				if ($validY) { $settings[$Index].GridY = $Y }
+				if ("$FilePath".Length -gt 0 -and $Index -ge $n){
+					$settings[$Index].Path = $settings[$Index % $n].Path
+				}
+			}
+		}
+		finalize
+	}
+}
+
+function TranscodeWallpaper($settings, $newBitmapPath)
+{
+	# get display size information
+	$union = [System.Drawing.Rectangle]::new(0,0,0,0)
+	$displays = Get-Display | sort X | % {
+		$r = [System.Drawing.Rectangle]::new([int]$_.X,[int]$_.Y,[int]$_.Width,[int]$_.Height)
+		$union = [System.Drawing.Rectangle]::Union($r, $union)
+		$r
+	}
+	$displays | %{ $_.X -= $union.X; $_.Y -= $union.Y; }
+
+	# open target bitmap
+	try{
+		$fs = [System.IO.File]::OpenRead($newBitmapPath)
+		$newBitmap = [System.Drawing.Image]::FromStream($fs)
+		$fs.Close()
+		$fs.Dispose()
+		if ($newBitmap.Size -ne $union.Size) {
+			throw "existing bitmap has wrong size"
+		}
+	} catch {
+		$newBitmap = [System.Drawing.Bitmap]::new(
+			$union.Width,
+			$union.Height,
+			[System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+	}
+	$g = [System.Drawing.Graphics]::FromImage($newBitmap)
+	function updateDisplay($displayIndex){
+		if ($displayIndex -lt 0 -or $displayIndex -ge $settings.Count){
+			return $false
+		}
+		Write-Verbose "Display$displayIndex"
+		$display = $displays[$displayIndex]
+		Write-Verbose "Display$displayIndex = $display"
+		$g.SetClip($display, [System.Drawing.Drawing2D.CombineMode]::Replace)
+
+		$filePathInternal = $settings[$displayIndex].Path
+		$X = $settings[$displayIndex].GridX
+		$Y = $settings[$displayIndex].GridY
+
+		# open image
+		try {
+			$fullPath = Resolve-Path -LiteralPath "$filePathInternal" -ErrorAction SilentlyContinue
+			$image = [System.Drawing.Image]::FromFile($fullPath)
+			Write-Verbose "Loaded $filePathInternal"
+		}
+		catch {
+			Write-Error "Can't load $filePathInternal"
+			return $false
+		}
+
+		if ($X -gt 0 -and $Y -gt 0) {
+			$w = $display.Width / $X
+			$h = $display.Height / $Y
+		}
+		elseif ($X -gt 0) {
+			$w = [math]::Floor($display.Width / $X)
+			$h = [math]::Floor($image.Height / $image.Width * $w)
+		}
+		elseif ($Y -gt 0) {
+			$h = [math]::Floor($display.Height / $Y)
+			$w = [math]::Floor($image.Width / $image.Height * $h)
+		}
+		else
+		{
+			$w = $image.Width
+			$h = $image.Height
+		}
+
+		$tile = [System.Drawing.Bitmap]::new($image, $w, $h)
+		$image.Dispose()
+
+		Write-Verbose "TileSize= $($tile.Size)"
+
+		$yy = $display.Y
+		while($yy -lt $display.Bottom) {
+			$xx = $display.X
+			$mirrorAgain = $true
+			while($xx -lt $display.Right){
+				$g.DrawImage($tile, $xx, $yy, $tile.Width, $tile.Height)
+				$tile.RotateFlip([System.Drawing.RotateFlipType]::Rotate180FlipY)
+				$xx += $w
+				$mirrorAgain = -not $mirrorAgain
+			}
+			if ($mirrorAgain){
+				$tile.RotateFlip([System.Drawing.RotateFlipType]::Rotate180FlipY)
+			}
+			$tile.RotateFlip([System.Drawing.RotateFlipType]::Rotate180FlipNone)
+			$yy += $h
+		}
+		$tile.Dispose()
+		return $true
+	}
+	for ($di=0; $di -lt $settings.Count; ++$di){
+		$null = updateDisplay $di
+	}
+	$null = $g.Save()
+	$g.Dispose()
+	# save bitmap
+	$newBitmap.Save($newBitmapPath);
+	$newBitmap.Dispose()
 }
